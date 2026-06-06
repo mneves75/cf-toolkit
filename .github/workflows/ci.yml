@@ -13,7 +13,7 @@ jobs:
     # macOS is the supported platform (Keychain + BSD sed/grep/awk), so test there.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Install Node explicitly: the scripts and test suite shell out to `node`, and
       # we don't rely on it being preinstalled on the runner image.
