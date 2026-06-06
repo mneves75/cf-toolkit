@@ -17,7 +17,7 @@ jobs:
 
       # Install Node explicitly: the scripts and test suite shell out to `node`, and
       # we don't rely on it being preinstalled on the runner image.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: lts/*
 
