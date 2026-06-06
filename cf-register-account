@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# cf-register-account — store a Cloudflare API token in the macOS login keychain,
+# scoped so the `security` CLI (and therefore direnv) can read it without a GUI prompt.
+#
+# Usage: cf-register-account <account-label>
+#   account-label : a short name you choose per account (e.g. pessoal, clienteA, agencia)
+#
+# The token is read from a hidden prompt — never passed as an argument, so it does not
+# land in your shell history. It is validated against the canonical token-verify endpoint
+# (GET /user/tokens/verify), which works for ANY valid token regardless of its scopes —
+# including a minimal `workers_scripts:edit` token — so a good token is never falsely
+# rejected, and a bad paste fails loudly instead of silently breaking a deploy later.
+#
+# Note: while running, the token is briefly visible in this user's process table (`ps`).
+# On a single-user Mac that exposure is acceptable; otherwise use the Keychain Access GUI.
+set -euo pipefail
+
+label="${1:-}"
+[ "$#" -eq 1 ] && [ -n "$label" ] || { echo "usage: cf-register-account <account-label>" >&2; exit 2; }
+[[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+  echo "error: account-label must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}" >&2; exit 2; }
+command -v curl >/dev/null 2>&1 || { echo "error: curl not found" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "error: node not found" >&2; exit 1; }
+
+service="cloudflare-token-${label}"
+
+printf 'Paste the Cloudflare API token for "%s" (input hidden): ' "$label" >&2
+read -rs token || true
+echo >&2
+[ -n "$token" ] || { echo "error: empty token" >&2; exit 1; }
+[[ "$token" != *$'\r'* && "$token" != *$'\n'* ]] || { echo "error: token contains a newline" >&2; exit 1; }
+
+echo "Validating token (GET /user/tokens/verify) ..." >&2
+resp=$(printf 'Authorization: Bearer %s\n' "$token" | curl -sS -H @- \
+  "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null || true)
+verdict=$(printf '%s' "$resp" | node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    try{ const j=JSON.parse(s);
+      if(j&&j.success&&j.result&&j.result.status==="active"){ process.stdout.write("active\t"); }
+      else{ const e=(j&&j.errors||[]).map(x=>x.message).join("; ");
+            process.stdout.write("bad\t"+(e||("status="+((j&&j.result||{}).status||"unknown")))); }
+    }catch{ process.stdout.write("err\tunparseable API response"); }
+  });')
+state=${verdict%%$'\t'*}
+detail=${verdict#*$'\t'}
+[ "$state" = active ] || { echo "error: token not active — not stored. ${detail}" >&2; exit 1; }
+
+security add-generic-password \
+  -a "$USER" -s "$service" \
+  -T /usr/bin/security \
+  -U -w "$token"
+
+echo "OK: token active, stored as keychain service '$service'." >&2
+echo "Pin a project to this account with: cf-init-project $label <account-id>" >&2

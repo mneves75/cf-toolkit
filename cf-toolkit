@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# cf-toolkit — umbrella command for the multi-account Cloudflare Wrangler toolkit.
+#
+# Usage:
+#   cf-toolkit register-account <label>             -> cf-register-account
+#   cf-toolkit init-project <label> <id> [name]     -> cf-init-project
+#   cf-toolkit guard                                -> cf-guard
+#   cf-toolkit version | -v | --version
+#   cf-toolkit help    | -h | --help
+#
+# Each subcommand simply execs the matching cf-* script; those scripts remain
+# usable directly too, so existing PATH/CI wiring keeps working unchanged.
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Resolve this script's real directory, following symlinks. Homebrew installs the
+# scripts into the Cellar and links them into <prefix>/bin as symlinks, so
+# BASH_SOURCE is the symlink path; the sibling cf-* scripts live next to the target.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  target=$(readlink "$self")
+  case "$target" in
+    /*) self="$target" ;;
+    *)  self="$(cd "$(dirname "$self")" && pwd)/$target" ;;
+  esac
+done
+here="$(cd "$(dirname "$self")" && pwd)"
+
+usage() {
+  cat <<EOF
+cf-toolkit $VERSION — multi-account Cloudflare Wrangler
+
+usage:
+  cf-toolkit register-account <label>            register a per-account API token
+  cf-toolkit init-project <label> <id> [name]    pin the current project to an account
+  cf-toolkit guard                               fail-fast pre-deploy account check
+  cf-toolkit version                             print version
+  cf-toolkit help                                show this help
+
+Subcommands map to cf-register-account, cf-init-project, and cf-guard, which can
+also be run directly. See: https://github.com/mneves75/cf-toolkit
+EOF
+}
+
+cmd="${1:-}"
+[ "$#" -eq 0 ] || shift
+
+case "$cmd" in
+  register-account|register) exec "$here/cf-register-account" "$@" ;;
+  init-project|init)         exec "$here/cf-init-project" "$@" ;;
+  guard)                     exec "$here/cf-guard" "$@" ;;
+  version|-v|--version)      echo "cf-toolkit $VERSION" ;;
+  help|-h|--help)            usage ;;
+  "")                        usage >&2; exit 2 ;;
+  *) echo "cf-toolkit: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+esac

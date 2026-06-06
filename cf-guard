@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# cf-guard — fail-fast if the currently loaded Cloudflare API token cannot access the
+# account_id pinned in this project's Wrangler config. This turns "the API would reject
+# a wrong-account deploy" into a deterministic LOCAL check that runs before the deploy.
+#
+# Usage: cf-guard            (run from the project directory)
+#   Wire it as an npm pre-deploy step:  "predeploy": "cf-guard"
+#   or call it by hand before `wrangler deploy`.
+#
+# Exit codes: 0 = token can access the pinned account; 1 = blocked; 2 = misconfig.
+# Bypass (e.g. transient network): CF_GUARD_SKIP=1 cf-guard
+#
+# The probe is GET /accounts/{id}/workers/scripts, which any deploy-capable token can
+# reach (it needs only Workers Scripts access) — so a minimal `workers_scripts:edit`
+# token works, not just the heavyweight "Edit Cloudflare Workers" template.
+#
+# Caveat: a token scoped to *all accounts* passes for every account by design — the
+# credential lock only exists if the token is scoped to a single account.
+set -euo pipefail
+
+[ "${CF_GUARD_SKIP:-0}" = "1" ] && { echo "cf-guard: skipped (CF_GUARD_SKIP=1)"; exit 0; }
+
+command -v curl >/dev/null 2>&1 || { echo "cf-guard: curl not found" >&2; exit 2; }
+command -v node >/dev/null 2>&1 || { echo "cf-guard: node not found" >&2; exit 2; }
+
+# 1) Locate the Wrangler config.
+cfg=""
+for c in wrangler.jsonc wrangler.json wrangler.toml; do
+  [ -f "$c" ] && { cfg="$c"; break; }
+done
+[ -n "$cfg" ] || { echo "cf-guard: no wrangler config in $PWD" >&2; exit 2; }
+
+# 2) Extract the pinned account_id with a targeted match (immune to other lines/comments).
+if [ "$cfg" = wrangler.toml ]; then
+  top_level_toml=$(sed '/^[[:space:]]*\[/,$d' "$cfg")
+  toml_pin_lines=$(printf '%s\n' "$top_level_toml" | grep -E '^[[:space:]]*account_id[[:space:]]*=' || true)
+  toml_pin_count=$(printf '%s\n' "$toml_pin_lines" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$toml_pin_count" -eq 0 ]; then
+    acct=""
+  elif [ "$toml_pin_count" -gt 1 ]; then
+    acct="MULTIPLE"
+  else
+    acct=$(printf '%s\n' "$toml_pin_lines" | grep -oE '"[0-9A-Fa-f]{32}"' | tr -d '"' || true)
+    [ -n "$acct" ] || acct="INVALID"
+  fi
+else
+  acct=$(node -e '
+    const fs=require("fs");
+    const s=fs.readFileSync(process.argv[1],"utf8");
+    let out="", inStr=false, esc=false, line=false, block=false;
+    for(let p=0;p<s.length;p++){
+      const ch=s[p], next=s[p+1];
+      if(line){ if(ch==="\n"){ line=false; out+=ch; } continue; }
+      if(block){ if(ch==="*"&&next==="/"){ block=false; p++; } else if(ch==="\n"){ out+=ch; } continue; }
+      if(inStr){ out+=ch; if(esc){ esc=false; } else if(ch==="\\"){ esc=true; } else if(ch==="\""){ inStr=false; } continue; }
+      if(ch==="\""){ inStr=true; out+=ch; continue; }
+      if(ch==="/"&&next==="/"){ line=true; p++; continue; }
+      if(ch==="/"&&next==="*"){ block=true; p++; continue; }
+      out+=ch;
+    }
+    const readString=(t,start)=>{
+      let val="", esc=false;
+      for(let p=start+1;p<t.length;p++){
+        const ch=t[p];
+        if(esc){ val+=ch; esc=false; continue; }
+        if(ch==="\\"){ esc=true; continue; }
+        if(ch==="\""){ return [val,p+1]; }
+        val+=ch;
+      }
+      return [null,start+1];
+    };
+    const vals=[]; let depth=0;
+    for(let p=0;p<out.length;p++){
+      const ch=out[p];
+      if(ch==="\""){
+        const [key,next]=readString(out,p);
+        if(depth===1&&key==="account_id"){
+          let q=next; while(/\s/.test(out[q]||"")) q++;
+          if(out[q]===":"){
+            q++; while(/\s/.test(out[q]||"")) q++;
+            if(out[q]==="\""){ const [val,after]=readString(out,q); vals.push(val); p=after-1; continue; }
+            vals.push(null); p=q; continue;
+          }
+        }
+        p=next-1; continue;
+      }
+      if(ch==="{") depth++;
+      else if(ch==="}") depth--;
+    }
+    process.stdout.write(vals.length===0 ? "" : vals.length>1 ? "MULTIPLE" : /^[0-9A-Fa-f]{32}$/.test(vals[0]||"") ? vals[0] : "INVALID");
+  ' "$cfg")
+fi
+[ "$acct" != "MULTIPLE" ] || { echo "cf-guard: $cfg has multiple account_id entries" >&2; exit 2; }
+[ "$acct" != "INVALID" ] || { echo "cf-guard: $cfg has an invalid account_id" >&2; exit 2; }
+[ -n "$acct" ] || { echo "cf-guard: $cfg does not pin account_id — run cf-init-project first" >&2; exit 2; }
+[[ "$acct" =~ ^[0-9A-Fa-f]{32}$ ]] || { echo "cf-guard: $cfg has an invalid account_id" >&2; exit 2; }
+
+# 3) A token must be loaded (normally by direnv via .envrc).
+tok="${CLOUDFLARE_API_TOKEN:-}"
+[ -n "$tok" ] || { echo "cf-guard: CLOUDFLARE_API_TOKEN not set — is direnv active here? (cd out/in, or 'direnv allow')" >&2; exit 2; }
+[[ "$tok" != *$'\r'* && "$tok" != *$'\n'* ]] || { echo "cf-guard: CLOUDFLARE_API_TOKEN contains a newline" >&2; exit 2; }
+
+# 4) Probe: can THIS token act on THIS account? No -f, so we keep the JSON body on 403.
+resp=$(printf 'Authorization: Bearer %s\n' "$tok" | curl -sS -H @- \
+  "https://api.cloudflare.com/client/v4/accounts/$acct/workers/scripts" 2>/dev/null || true)
+
+verdict=$(printf '%s' "$resp" | node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    try{ const j=JSON.parse(s);
+      if(j&&j.success){ process.stdout.write("yes\t"); }
+      else{ process.stdout.write("no\t"+((j&&j.errors||[]).map(x=>x.message).join("; "))); }
+    }catch{ process.stdout.write("err\t"); }
+  });')
+
+state=${verdict%%$'\t'*}
+detail=${verdict#*$'\t'}
+
+case "$state" in
+  yes) echo "cf-guard: OK — token can access account $acct"; exit 0 ;;
+  no)  echo "cf-guard: BLOCKED — loaded token cannot access pinned account $acct" >&2
+       [ -n "$detail" ] && echo "          API: $detail" >&2
+       echo "          (wrong token for this project, or token not scoped to this account)" >&2
+       exit 1 ;;
+  *)   echo "cf-guard: could not verify (network/API error). Failing closed; CF_GUARD_SKIP=1 to override." >&2
+       exit 1 ;;
+esac
