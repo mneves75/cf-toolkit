@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS is the supported platform (Keychain + BSD sed/grep/awk), so test there.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Install Node explicitly: the scripts and test suite shell out to `node`, and
+      # we don't rely on it being preinstalled on the runner image.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Install ShellCheck
+        run: brew install shellcheck
+
+      - name: Syntax check (bash -n)
+        run: bash -n cf-register-account cf-init-project cf-guard cf-toolkit tests/run-offline.sh
+
+      - name: ShellCheck
+        run: shellcheck cf-register-account cf-init-project cf-guard cf-toolkit tests/run-offline.sh
+
+      - name: Offline test suite
+        run: bash tests/run-offline.sh

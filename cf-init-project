@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# cf-init-project — pin the CURRENT project to one Cloudflare account and wire token loading.
+# Run it from inside the project directory.
+#
+# Usage: cf-init-project <account-label> <account-id> [worker-name]
+#   account-label : the keychain label you registered with cf-register-account
+#   account-id    : the Cloudflare account ID to pin (non-secret; from the dashboard)
+#   worker-name   : optional; defaults to the current directory name
+#
+# It establishes TWO independent locks against deploying to the wrong account:
+#   1. account_id pinned in the Wrangler config -> Wrangler targets exactly this account.
+#   2. .envrc loads the token scoped to ONLY this account -> the API rejects any other.
+#
+# Config editing is safe: the JSON/JSONC path inserts account_id after the opening brace,
+# preserves comments, validates the result (comment- and trailing-comma-tolerant), and
+# refuses to write if it cannot produce valid JSON. The TOML path keeps account_id at the
+# top level even when [tables] are present. Re-running never duplicates the key.
+set -euo pipefail
+
+label="${1:-}"; account_id="${2:-}"; worker="${3:-$(basename "$PWD")}"
+[ "$#" -ge 2 ] && [ "$#" -le 3 ] && [ -n "$label" ] && [ -n "$account_id" ] || {
+  echo "usage: cf-init-project <account-label> <account-id> [worker-name]" >&2; exit 2; }
+[[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+  echo "error: account-label must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}" >&2; exit 2; }
+[[ "$account_id" =~ ^[0-9A-Fa-f]{32}$ ]] || {
+  echo "error: account-id must be a 32-character Cloudflare account tag" >&2; exit 2; }
+
+# --- 1) Pin account_id in the Wrangler config (deploy-target lock) -----------------
+if [ -f wrangler.jsonc ] || [ -f wrangler.json ]; then
+  cfg=$([ -f wrangler.jsonc ] && echo wrangler.jsonc || echo wrangler.json)
+  command -v node >/dev/null 2>&1 || { echo "• ERROR: node needed to edit $cfg safely — add account_id manually" >&2; exit 1; }
+  res=$(node -e '
+    const fs=require("fs");
+    const [f,id]=process.argv.slice(1);
+    (()=>{
+      let s=fs.readFileSync(f,"utf8");
+      const stripJsonc=t=>{
+        let out="", inStr=false, esc=false, line=false, block=false;
+        for(let p=0;p<t.length;p++){
+          const ch=t[p], next=t[p+1];
+          if(line){ if(ch==="\n"){ line=false; out+=ch; } continue; }
+          if(block){ if(ch==="*"&&next==="/"){ block=false; p++; } else if(ch==="\n"){ out+=ch; } continue; }
+          if(inStr){ out+=ch; if(esc){ esc=false; } else if(ch==="\\"){ esc=true; } else if(ch==="\""){ inStr=false; } continue; }
+          if(ch==="\""){ inStr=true; out+=ch; continue; }
+          if(ch==="/"&&next==="/"){ line=true; p++; continue; }
+          if(ch==="/"&&next==="*"){ block=true; p++; continue; }
+          out+=ch;
+        }
+        return out;
+      };
+      const readString=(t,start)=>{
+        let val="", esc=false;
+        for(let p=start+1;p<t.length;p++){
+          const ch=t[p];
+          if(esc){ val+=ch; esc=false; continue; }
+          if(ch==="\\"){ esc=true; continue; }
+          if(ch==="\""){ return [val,p+1]; }
+          val+=ch;
+        }
+        return [null,start+1];
+      };
+      const topLevelAccountIds=t=>{
+        const vals=[]; let depth=0;
+        for(let p=0;p<t.length;p++){
+          const ch=t[p];
+          if(ch==="\""){
+            const [key,next]=readString(t,p);
+            if(depth===1&&key==="account_id"){
+              let q=next; while(/\s/.test(t[q]||"")) q++;
+              if(t[q]===":"){
+                q++; while(/\s/.test(t[q]||"")) q++;
+                if(t[q]==="\""){ const [val,after]=readString(t,q); vals.push(val); p=after-1; continue; }
+                vals.push(null); p=q; continue;
+              }
+            }
+            p=next-1; continue;
+          }
+          if(ch==="{") depth++;
+          else if(ch==="}") depth--;
+        }
+        return vals;
+      };
+      const active=stripJsonc(s);
+      const activePins=topLevelAccountIds(active);
+      if(activePins.length===1){
+        if(/^[0-9A-Fa-f]{32}$/.test(activePins[0]||"")){ process.stdout.write("HAS"); return; }
+        process.stdout.write("ERR_BADID"); return;
+      }
+      if(activePins.length>1){process.stdout.write("ERR_DUP");return;}
+      const i=s.indexOf("{");
+      if(i<0){process.stdout.write("ERR_NOOBJ");return;}
+      const dropTrailingCommas=t=>{
+        let out="", inStr=false, esc=false;
+        for(let p=0;p<t.length;p++){
+          const ch=t[p];
+          if(inStr){ out+=ch; if(esc){ esc=false; } else if(ch==="\\"){ esc=true; } else if(ch==="\""){ inStr=false; } continue; }
+          if(ch==="\""){ inStr=true; out+=ch; continue; }
+          if(ch===","){
+            let q=p+1; while(/\s/.test(t[q]||"")) q++;
+            if(t[q]==="}"||t[q]==="]") continue;
+          }
+          out+=ch;
+        }
+        return out;
+      };
+      const norm=t=>dropTrailingCommas(stripJsonc(t));
+      // add a trailing comma only if a property follows (i.e. object is not empty)
+      const after=stripJsonc(s.slice(i+1)).trimStart();
+      const comma=!after.startsWith("}");
+      const cand=s.slice(0,i+1)+"\n  \"account_id\": "+JSON.stringify(id)+(comma?",":"")+s.slice(i+1);
+      try{JSON.parse(norm(cand));fs.writeFileSync(f,cand);process.stdout.write("WROTE");}
+      catch(e){process.stdout.write("ERR_INVALID");}
+    })();
+  ' "$cfg" "$account_id")
+  case "$res" in
+    HAS)         echo "• $cfg already pins account_id" ;;
+    WROTE)       echo "• inserted account_id into $cfg" ;;
+    ERR_DUP)     echo "• ERROR: $cfg has multiple active account_id keys — fix manually" >&2; exit 1 ;;
+    ERR_BADID)   echo "• ERROR: $cfg has an invalid top-level account_id — fix manually" >&2; exit 1 ;;
+    ERR_NOOBJ)   echo "• ERROR: $cfg has no JSON object — add \"account_id\": \"$account_id\" manually" >&2; exit 1 ;;
+    ERR_INVALID) echo "• ERROR: could not safely edit $cfg (left untouched) — add \"account_id\": \"$account_id\" manually" >&2; exit 1 ;;
+  esac
+elif [ -f wrangler.toml ]; then
+  top_level_toml=$(sed '/^[[:space:]]*\[/,$d' wrangler.toml)
+  if printf '%s\n' "$top_level_toml" | grep -qE '^[[:space:]]*account_id[[:space:]]*='; then
+    echo "• wrangler.toml already pins account_id"; printf '%s\n' "$top_level_toml" | grep -E '^[[:space:]]*account_id' || true
+  elif grep -qE '^[[:space:]]*\[' wrangler.toml; then
+    # keep account_id top-level: insert it just before the first [table] header
+    awk -v l="account_id = \"$account_id\"" '!d && /^[[:space:]]*\[/{print l; d=1} {print}' \
+      wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
+    echo "• inserted account_id into wrangler.toml (before first table)"
+  else
+    printf 'account_id = "%s"\n' "$account_id" >> wrangler.toml
+    echo "• appended account_id to wrangler.toml"
+  fi
+else
+  [[ "$worker" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,254}$ ]] || {
+    echo "error: worker-name must use only letters, numbers, and dashes; it cannot start with a dash" >&2; exit 2; }
+  cat > wrangler.jsonc <<EOF
+{
+  "\$schema": "./node_modules/wrangler/config-schema.json",
+  "account_id": "$account_id",
+  "name": "$worker",
+  "main": "src/index.ts",
+  "compatibility_date": "$(date +%F)"
+}
+EOF
+  echo "• created wrangler.jsonc"
+fi
+
+# --- 2) Wire token loading for this project (credential lock) ----------------------
+existing_envrc=""
+if [ -f .envrc ]; then
+  existing_envrc=$(awk '
+    /^# >>> cf-toolkit$/ { skip=1; next }
+    /^# <<< cf-toolkit$/ { skip=0; next }
+    !skip { print }
+  ' .envrc)
+fi
+{
+  [ -n "$existing_envrc" ] && { printf '%s\n\n' "$existing_envrc"; }
+  cat <<EOF
+# >>> cf-toolkit
+# Loads the Cloudflare API token for account "$label" from the macOS login keychain.
+# Contains NO secret — only a keychain lookup — so it is safe to commit.
+export CLOUDFLARE_API_TOKEN="\$(security find-generic-password -a "\$USER" -s "cloudflare-token-$label" -w 2>/dev/null)"
+if [ -z "\$CLOUDFLARE_API_TOKEN" ]; then
+  echo "cf: no keychain token for '$label' — run: cf-register-account $label" >&2
+fi
+# <<< cf-toolkit
+EOF
+} > .envrc
+echo "• wrote .envrc (account: $label)"
+
+if command -v direnv >/dev/null 2>&1; then
+  direnv allow . >/dev/null 2>&1 || true
+  echo "• direnv allowed — token now loads automatically on cd into this folder"
+else
+  echo "• direnv not installed. Either 'brew install direnv' (recommended), or per session run:"
+  echo "    export CLOUDFLARE_API_TOKEN=\"\$(security find-generic-password -a \"\$USER\" -s cloudflare-token-$label -w)\""
+fi
+
+# --- 3) Keep accidental secret files out of git ------------------------------------
+touch .gitignore
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  tracked_secrets=$(git ls-files -- .env '.env.*' .dev.vars '.dev.vars.*' || true)
+  [ -z "$tracked_secrets" ] || {
+    echo "• WARN: tracked secret-like files remain in git:" >&2
+    printf '%s\n' "$tracked_secrets" >&2
+  }
+fi
+for f in .dev.vars '.dev.vars.*' .env '.env.*'; do
+  grep -qxF "$f" .gitignore || echo "$f" >> .gitignore
+done
+
+echo "Done. Verify the project resolves to the right account with:  wrangler whoami"

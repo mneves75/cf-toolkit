@@ -1,0 +1,5 @@
+# Nothing secret lives here, but keep stray local artifacts out of the repo.
+*.bak
+*.bak-*
+*.tmp
+.DS_Store
